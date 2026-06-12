@@ -14,6 +14,7 @@
 ***************************************************************************************/
 
 #include <isa.h>
+#include <memory/vaddr.h>
 #include <string.h>
 
 /* We use the POSIX regex functions to process regular expressions.
@@ -22,36 +23,35 @@
 #include <regex.h>
 
 enum {
-  TK_NOTYPE = 256, TK_EQ,
+  TK_NOTYPE = 256,
+  TK_EQ,
   TK_NUM,
-  /* TODO: Add more token types */
-
+  TK_REG,
+  TK_NEG,
+  TK_POS,
+  TK_DEREF,
 };
 
 static struct rule {
   const char *regex;
   int token_type;
 } rules[] = {
-
-  /* TODO: Add more rules.
-   * Pay attention to the precedence level of different rules.
-   */
-  // Hex number (0x...)
-  {"0x[0-9a-f]+", TK_NUM},
-  // Decimal number
-  {"[0-9]+",       TK_NUM},
-  // Operators and parentheses
-  {"\\*",          '*'},
-  {"/",            '/'},
-  {"\\(",          '('},
-  {"\\)",          ')'},
-  {"-",            '-'},   // subtraction
-  {" +", TK_NOTYPE},    // spaces
-  {"\\+", '+'},         // plus
-  {"==", TK_EQ},        // equal
+  {" +",                 TK_NOTYPE},
+  {"==",                 TK_EQ},
+  {"0[xX][0-9a-fA-F]+",  TK_NUM},
+  {"[0-9]+",             TK_NUM},
+  {"\\$[a-zA-Z0-9]+",    TK_REG},
+  {"\\+",                '+'},
+  {"-",                  '-'},
+  {"\\*",                '*'},
+  {"/",                  '/'},
+  {"\\(",                '('},
+  {"\\)",                ')'},
 };
 
 #define NR_REGEX ARRLEN(rules)
+#define MAX_TOKENS 128
+#define MAX_TOKEN_LEN 64
 
 static regex_t re[NR_REGEX] = {};
 
@@ -74,11 +74,54 @@ void init_regex() {
 
 typedef struct token {
   int type;
-  char str[32];
+  char str[MAX_TOKEN_LEN];
 } Token;
 
-static Token tokens[32] __attribute__((used)) = {};
+static Token tokens[MAX_TOKENS] __attribute__((used)) = {};
 static int nr_token __attribute__((used))  = 0;
+
+static bool add_token(int type, const char *str, int len) {
+  if (nr_token >= MAX_TOKENS) {
+    printf("too many tokens\n");
+    return false;
+  }
+
+  tokens[nr_token].type = type;
+  tokens[nr_token].str[0] = '\0';
+
+  if (str != NULL) {
+    if (len >= MAX_TOKEN_LEN) {
+      printf("token is too long: %.*s\n", len, str);
+      return false;
+    }
+    memcpy(tokens[nr_token].str, str, len);
+    tokens[nr_token].str[len] = '\0';
+  }
+
+  nr_token++;
+  return true;
+}
+
+static bool is_operand(int type) {
+  return type == TK_NUM || type == TK_REG || type == ')';
+}
+
+static void mark_unary_ops() {
+  for (int i = 0; i < nr_token; i++) {
+    bool unary = (i == 0 || !is_operand(tokens[i - 1].type));
+    if (!unary) {
+      continue;
+    }
+
+    if (tokens[i].type == '-') {
+      tokens[i].type = TK_NEG;
+    } else if (tokens[i].type == '+') {
+      tokens[i].type = TK_POS;
+    } else if (tokens[i].type == '*') {
+      tokens[i].type = TK_DEREF;
+    }
+  }
+}
 
 static bool make_token(char *e) {
   int position = 0;
@@ -92,36 +135,28 @@ static bool make_token(char *e) {
     for (i = 0; i < NR_REGEX; i ++) {
       if (regexec(&re[i], e + position, 1, &pmatch, 0) == 0 && pmatch.rm_so == 0) {
         char *substr_start = e + position;
-        int substr_len = pmatch.rm_eo;
+        int substr_len = (int)pmatch.rm_eo;
 
         Log("match rules[%d] = \"%s\" at position %d with len %d: %.*s",
             i, rules[i].regex, position, substr_len, substr_len, substr_start);
 
         position += substr_len;
 
-        /* TODO: Now a new token is recognized with rules[i]. Add codes
-         * to record the token in the array `tokens'. For certain types
-         * of tokens, some extra actions should be performed.
-         */
-
         switch (rules[i].token_type) {
+          case TK_NOTYPE:
+            break;
           case TK_NUM:
-            tokens[nr_token].type = TK_NUM;
-            // Copy the matched substring into tokens[nr_token].str
-            strncpy(tokens[nr_token].str, substr_start, substr_len);
-            tokens[nr_token].str[substr_len] = '\0';
-            nr_token++;
+          case TK_REG:
+            if (!add_token(rules[i].token_type, substr_start, substr_len)) {
+              return false;
+            }
             break;
           case '+': case '-': case '*': case '/': case '(': case ')':
-            tokens[nr_token].type = rules[i].token_type;  // e.g., '+'
-            nr_token++;
+          case TK_EQ:
+            if (!add_token(rules[i].token_type, NULL, 0)) {
+              return false;
+            }
             break;
-          case TK_EQ:           // keep for future
-            tokens[nr_token].type = TK_EQ;
-            nr_token++;
-            break;
-          case TK_NOTYPE:       // spaces – do nothing
-             break;
           default: TODO();
         }
 
@@ -135,118 +170,218 @@ static bool make_token(char *e) {
     }
   }
 
+  mark_unary_ops();
   return true;
 }
 
-static word_t token2val(int i) {
+static bool token2val(int i, word_t *val) {
   char *str = tokens[i].str;
-  if (str[0] == '0' && str[1] == 'x') {
-    return strtol(str, NULL, 16);
+  char *end = NULL;
+  unsigned long long result;
+
+  if (str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+    result = strtoull(str, &end, 16);
   } else {
-    return atoi(str);
+    result = strtoull(str, &end, 10);
   }
+
+  if (end == str || *end != '\0') {
+    return false;
+  }
+
+  *val = (word_t)result;
+  return true;
 }
 
-// Return precedence of operator (higher value = higher precedence)
+static bool reg2val(int i, word_t *val) {
+  bool success = false;
+  *val = isa_reg_str2val(tokens[i].str, &success);
+  if (!success && strcmp(tokens[i].str, "/bin/zsh") == 0) {
+    *val = 0;
+    return true;
+  }
+  return success;
+}
+
 static int precedence(int op) {
   switch (op) {
-    case '*': case '/': return 2;
-    case '+': case '-': return 1;
+    case TK_EQ: return 1;
+    case '+': case '-': return 2;
+    case '*': case '/': return 3;
     default: return 0;
   }
 }
 
+static bool check_parentheses(int p, int q) {
+  if (tokens[p].type != '(' || tokens[q].type != ')') {
+    return false;
+  }
+
+  int level = 0;
+  for (int i = p; i <= q; i++) {
+    if (tokens[i].type == '(') {
+      level++;
+    } else if (tokens[i].type == ')') {
+      level--;
+      if (level < 0) {
+        return false;
+      }
+    }
+
+    if (level == 0 && i < q) {
+      return false;
+    }
+  }
+
+  return level == 0;
+}
+
+static bool is_binary_op(int type) {
+  return type == TK_EQ || type == '+' || type == '-' || type == '*' || type == '/';
+}
+
+static int find_main_op(int p, int q, bool *success) {
+  int op = -1;
+  int min_prec = 100;
+  int level = 0;
+
+  for (int i = p; i <= q; i++) {
+    int type = tokens[i].type;
+
+    if (type == '(') {
+      level++;
+      continue;
+    }
+
+    if (type == ')') {
+      level--;
+      if (level < 0) {
+        *success = false;
+        return -1;
+      }
+      continue;
+    }
+
+    if (level == 0 && is_binary_op(type)) {
+      int prec = precedence(type);
+      if (prec <= min_prec) {
+        min_prec = prec;
+        op = i;
+      }
+    }
+  }
+
+  if (level != 0) {
+    *success = false;
+    return -1;
+  }
+
+  return op;
+}
 
 // Recursive evaluation of tokens from index p to q (inclusive)
-static word_t eval(int p, int q) {
-    if (p > q) {
-        assert(0 && "Empty token range");
+static word_t eval(int p, int q, bool *success) {
+  if (p > q) {
+    *success = false;
+    return 0;
+  }
+
+  while (p < q && check_parentheses(p, q)) {
+    p++;
+    q--;
+  }
+
+  if (p == q) {
+    word_t val = 0;
+
+    if (tokens[p].type == TK_NUM) {
+      *success = token2val(p, &val);
+      return *success ? val : 0;
+    }
+    if (tokens[p].type == TK_REG) {
+      *success = reg2val(p, &val);
+      return *success ? val : 0;
     }
 
-    // Single token -> must be a number
-    if (p == q && tokens[p].type == TK_NUM) {
-        return token2val(p);
-    }
+    *success = false;
+    return 0;
+  }
 
-    // Remove outer parentheses if they wrap the whole expression
-    if (tokens[p].type == '(' && tokens[q].type == ')') {
-        // Check that the parentheses are balanced and enclose everything
-        int paren = 0, i;
-        for (i = p; i <= q; i++) {
-            if (tokens[i].type == '(') paren++;
-            if (tokens[i].type == ')') paren--;
-            if (paren == 0 && i < q) break; // not outermost
-        }
-        if (i == q) {
-            return eval(p + 1, q - 1);
-        }
-    }
+  int op = find_main_op(p, q, success);
+  if (!*success) {
+    return 0;
+  }
 
-    // Find the main operator (lowest precedence, not inside parentheses)
-    int op = -1;
-    int min_prec = 100;
-    int paren_level = 0;
-    for (int i = p; i <= q; i++) {
-        if (tokens[i].type == '(') {
-            paren_level++;
-        } else if (tokens[i].type == ')') {
-            paren_level--;
-        } else if (paren_level == 0) {
-            int prec = precedence(tokens[i].type);
-            if (prec > 0) {
-                // Choose the rightmost operator among the lowest precedence
-                if (prec < min_prec) {
-                    min_prec = prec;
-                    op = i;
-                }
-            }
-        }
-    }
+  if (op == -1) {
+    word_t val;
 
-    // If no binary operator found, check for unary minus/plus at the start
-    if (op == -1) {
-        // The expression could be something like "-5" or "+3"
-        if (p <= q && (tokens[p].type == '-' || tokens[p].type == '+')) {
-            word_t val = eval(p + 1, q);
-            return (tokens[p].type == '-') ? -val : val;
-        }
-        assert(0 && "No operator found and not a unary expression");
+    switch (tokens[p].type) {
+      case TK_NEG:
+        val = eval(p + 1, q, success);
+        return *success ? -val : 0;
+      case TK_POS:
+        return eval(p + 1, q, success);
+      case TK_DEREF:
+        val = eval(p + 1, q, success);
+        return *success ? vaddr_read(val, sizeof(word_t)) : 0;
+      default:
+        *success = false;
+        return 0;
     }
+  }
 
-    // Handle unary minus/plus when the operator is at the very beginning of the range
-    // This prevents evaluation of an empty left side.
-    if (op == p && (tokens[op].type == '-' || tokens[op].type == '+')) {
-        word_t val = eval(op + 1, q);
-        return (tokens[op].type == '-') ? -val : val;
-    }
+  if (op == p || op == q) {
+    *success = false;
+    return 0;
+  }
 
-    // Binary operator
-    word_t left_val = eval(p, op - 1);
-    word_t right_val = eval(op + 1, q);
+  word_t left_val = eval(p, op - 1, success);
+  if (!*success) {
+    return 0;
+  }
 
-    switch (tokens[op].type) {
-        case '+': return left_val + right_val;
-        case '-': return left_val - right_val;
-        case '*': return left_val * right_val;
-        case '/': return left_val / right_val;   // integer division truncates toward zero
-        default:  assert(0 && "Unknown operator");
-    }
+  word_t right_val = eval(op + 1, q, success);
+  if (!*success) {
+    return 0;
+  }
+
+  switch (tokens[op].type) {
+    case TK_EQ: return left_val == right_val;
+    case '+': return left_val + right_val;
+    case '-': return left_val - right_val;
+    case '*': return left_val * right_val;
+    case '/':
+      if (right_val == 0) {
+        *success = false;
+        return 0;
+      }
+      return left_val / right_val;
+    default:
+      *success = false;
+      return 0;
+  }
 }
 
 word_t expr(char *e, bool *success) {
+  if (success == NULL) {
+    return 0;
+  }
+  *success = true;
+
+  if (e == NULL) {
+    *success = false;
+    return 0;
+  }
+
   if (!make_token(e)) {
     *success = false;
     return 0;
   }
 
-  
-// Evaluate the token list
   if (nr_token == 0) {
     *success = false;
     return 0;
   }
-  
-  word_t result = eval(0, nr_token - 1);
-  *success = true;
-  return result;
+
+  return eval(0, nr_token - 1, success);
 }
