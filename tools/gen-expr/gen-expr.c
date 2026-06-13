@@ -12,7 +12,6 @@
 *
 * See the Mulan PSL v2 for more details.
 ***************************************************************************************/
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,10 +19,11 @@
 #include <assert.h>
 #include <string.h>
 #include <stdbool.h>
+#include <sys/wait.h>
 
-// buffers
 static char buf[65536];
 static char code_buf[65536 + 128];
+
 static char *code_format =
     "#include <stdio.h>\n"
     "int main() { "
@@ -32,182 +32,96 @@ static char *code_format =
     "  return 0; "
     "}";
 
-static int buf_id;   // current writing position in buf
+static int buf_id;
 
-// ----- helper: write a string to buf -----
-static void write_str(const char *s) {
+static uint32_t choose(uint32_t n) {
+    return rand() % n;
+}
+
+static void gen(char c) {
+    assert(buf_id < sizeof(buf) - 1);
+    buf[buf_id++] = c;
+}
+
+static void gen_str(const char *s) {
     while (*s) {
-        buf[buf_id++] = *s++;
+        gen(*s++);
     }
 }
 
-// ----- generate a number (non‑uniform distribution) -----
+static void gen_spaces(void) {
+    int n = choose(4);   // 0..3 spaces
+    for (int i = 0; i < n; i++) {
+        gen(' ');
+    }
+}
+
 static void gen_num(void) {
     char tmp[32];
-    if (rand() % 2 == 0) {
-        // small number 0..100
-        sprintf(tmp, "%d", rand() % 101);
+
+    uint32_t val;
+    if (choose(2) == 0) {
+        val = choose(100);
     } else {
-        // large number, possibly with high bit set
-        uint32_t big = rand();
-        if (rand() % 2 == 0) big |= 0x80000000;
-        sprintf(tmp, "%u", big);
+        val = ((uint32_t)rand() << 16) ^ rand();
     }
-    write_str(tmp);
+
+    /*
+     * Add 'u' suffix to force unsigned arithmetic in GCC.
+     * Example: 123u, 4000000000u
+     */
+    snprintf(tmp, sizeof(tmp), "%uu", val);
+    gen_str(tmp);
 }
 
-// ----- generate a register -----
-static void gen_reg(void) {
-    const char *regs[] = {"$a0", "$sp", "$t0", "$zero"};
-    write_str(regs[rand() % 4]);
+static void gen_rand_op(void) {
+    char ops[] = {'+', '-', '*', '/'};
+    gen_spaces();
+    gen(ops[choose(4)]);
+    gen_spaces();
 }
 
-// ----- generate random whitespace (0-3 spaces/tabs) -----
-static void gen_whitespace(void) {
-    int n = rand() % 4;
-    for (int i = 0; i < n; i++) {
-        buf[buf_id++] = (rand() % 2 == 0) ? ' ' : '\t';
-    }
-}
-
-// ----- generate an operator, possibly with whitespace around it -----
-static void gen_op(char op) {
-    gen_whitespace();
-    buf[buf_id++] = op;
-    gen_whitespace();
-}
-
-// ----- recursive expression generator -----
-static void gen_expr(int depth) {
-    // Max depth to avoid stack overflow
-    if (depth >= 5 || (depth > 2 && rand() % 100 < 30)) {
-        // leaf node: number or register
-        if (rand() % 2 == 0) gen_num();
-        else gen_reg();
+static void gen_rand_expr_rec(int depth) {
+    /*
+     * Limit depth to avoid too long expressions and stack overflow.
+     * Also stop earlier sometimes to keep expressions varied.
+     */
+    if (depth > 6 || (depth > 2 && choose(100) < 30)) {
+        gen_spaces();
+        gen_num();
+        gen_spaces();
         return;
     }
 
-    // with probability 1/3, generate a unary operation: *expr or &expr
-    if (rand() % 3 == 0) {
-        if (rand() % 2 == 0) {
-            write_str("*(");
-            gen_expr(depth + 1);
-            buf[buf_id++] = ')';
-        } else {
-            write_str("&(");
-            gen_expr(depth + 1);
-            buf[buf_id++] = ')';
-        }
-        return;
-    }
+    switch (choose(3)) {
+        case 0:
+            gen_spaces();
+            gen_num();
+            gen_spaces();
+            break;
 
-    // binary operation
-    char op;
-    int op_choice = rand() % 4;
-    switch (op_choice) {
-        case 0: op = '+'; break;
-        case 1: op = '-'; break;
-        case 2: op = '*'; break;
-        case 3: op = '/'; break;
-        default: op = '+';
-    }
+        case 1:
+            gen_spaces();
+            gen('(');
+            gen_rand_expr_rec(depth + 1);
+            gen(')');
+            gen_spaces();
+            break;
 
-    buf[buf_id++] = '(';
-    gen_whitespace();
-    gen_expr(depth + 1);
-    gen_op(op);
-
-    // For division by zero: force right operand to 0
-    if (op == '/') {
-        write_str("0");
-    } else {
-        gen_expr(depth + 1);
+        default:
+            gen_spaces();
+            gen_rand_expr_rec(depth + 1);
+            gen_rand_op();
+            gen_rand_expr_rec(depth + 1);
+            gen_spaces();
+            break;
     }
-    gen_whitespace();
-    buf[buf_id++] = ')';
 }
 
-// ----- public entry point: generate a random expression into buf -----
 static void gen_rand_expr(void) {
     buf_id = 0;
-    gen_expr(0);
-    buf[buf_id] = '\0';   // null terminate
-}
-
-// ----- corrupt a valid expression to make it invalid -----
-static void corrupt_expr(char *s) {
-    int len = strlen(s);
-    if (len < 2) return;
-    int pos = rand() % len;
-    switch (rand() % 4) {
-        case 0: // delete a character
-            memmove(s + pos, s + pos + 1, len - pos);
-            break;
-        case 1: // insert an illegal character
-            memmove(s + pos + 1, s + pos, len - pos + 1);
-            s[pos] = '@';
-            break;
-        case 2: // duplicate an operator
-            if (strchr("+-*/", s[pos])) {
-                memmove(s + pos + 1, s + pos, len - pos + 1);
-                s[pos+1] = s[pos];
-            }
-            break;
-        case 3: // remove a parenthesis
-            if (s[pos] == '(' || s[pos] == ')') {
-                memmove(s + pos, s + pos + 1, len - pos);
-            }
-            break;
-    }
-}
-
-// ----- transform the expression for GCC evaluation -----
-// Replace: registers -> "0", *(...) -> "0", &(...) -> "0"
-// This is a simplified but sufficient transformation.
-static void transform_for_gcc(const char *src, char *dst) {
-    while (*src) {
-        if (*src == '$') {
-            // skip the register name, output "0"
-            while (*src && (isalnum(*src) || *src == '$')) src++;
-            strcat(dst, "0");
-        } else if (*src == '*') {
-            // assume it's followed by '('; replace "*(" with "0"
-            // For safety, we just output "0" and skip the whole subexpression
-            // This works because the subexpression will evaluate to 0 anyway.
-            strcat(dst, "0");
-            // skip until the matching ')' (simplistic but sufficient for test)
-            int paren = 1;
-            src++; // skip '*'
-            if (*src == '(') {
-                src++;
-                while (paren > 0 && *src) {
-                    if (*src == '(') paren++;
-                    else if (*src == ')') paren--;
-                    src++;
-                }
-            } else {
-                // not followed by '(', just skip one char
-                src++;
-            }
-        } else if (*src == '&') {
-            // address-of: replace with "0" and skip the parenthesized expression
-            strcat(dst, "0");
-            if (*(src+1) == '(') {
-                src += 2;
-                int paren = 1;
-                while (paren > 0 && *src) {
-                    if (*src == '(') paren++;
-                    else if (*src == ')') paren--;
-                    src++;
-                }
-            } else {
-                src++;
-            }
-        } else {
-            char ch = *src++;
-            strncat(dst, &ch, 1);
-        }
-    }
+    gen_rand_expr_rec(0);
+    buf[buf_id] = '\0';
 }
 
 int main(int argc, char *argv[]) {
@@ -219,37 +133,48 @@ int main(int argc, char *argv[]) {
     }
 
     for (int i = 0; i < loop; i++) {
-        // 10% chance to generate an invalid expression
-        int is_invalid = (rand() % 10 == 0);
+        gen_rand_expr();
 
-        gen_rand_expr();   // generate a valid expression
-
-        if (is_invalid) {
-            corrupt_expr(buf);
-            printf("invalid %s\n", buf);
+        int n = snprintf(code_buf, sizeof(code_buf), code_format, buf);
+        if (n < 0 || n >= sizeof(code_buf)) {
+            i--;
             continue;
         }
 
-        // valid case: transform for GCC, compile, run, print result
-        char gcc_expr[65536] = "";
-        transform_for_gcc(buf, gcc_expr);
-
-        sprintf(code_buf, code_format, gcc_expr);
-
         FILE *fp = fopen("/tmp/.code.c", "w");
-        if (!fp) { perror("fopen"); exit(1); }
+        if (fp == NULL) {
+            perror("fopen");
+            exit(1);
+        }
+
         fputs(code_buf, fp);
         fclose(fp);
 
-        int ret = system("gcc /tmp/.code.c -o /tmp/.expr");
-        if (ret != 0) continue;   // compilation failed – should not happen
+        int ret = system("gcc -w /tmp/.code.c -o /tmp/.expr");
+        if (ret != 0) {
+            i--;
+            continue;
+        }
 
         fp = popen("/tmp/.expr", "r");
-        if (!fp) { perror("popen"); continue; }
+        if (fp == NULL) {
+            perror("popen");
+            i--;
+            continue;
+        }
 
-        int result;
-        fscanf(fp, "%d", &result);
-        pclose(fp);
+        unsigned result;
+        int scan_ret = fscanf(fp, "%u", &result);
+        int status = pclose(fp);
+
+        /*
+         * If the expression has division by zero, the generated program
+         * may crash and produce no valid output. Skip it and retry.
+         */
+        if (scan_ret != 1 || status != 0) {
+            i--;
+            continue;
+        }
 
         printf("%u %s\n", result, buf);
     }
