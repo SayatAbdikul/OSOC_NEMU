@@ -38,8 +38,8 @@ static struct rule {
 } rules[] = {
   {" +",                 TK_NOTYPE},
   {"==",                 TK_EQ},
-  {"0[xX][0-9a-fA-F]+",  TK_NUM},
-  {"[0-9]+",             TK_NUM},
+  {"0[xX][0-9a-fA-F]+[uU]?", TK_NUM},
+  {"[0-9]+[uU]?",            TK_NUM},
   {"\\$[a-zA-Z0-9]+",    TK_REG},
   {"\\+",                '+'},
   {"-",                  '-'},
@@ -137,9 +137,6 @@ static bool make_token(char *e) {
         char *substr_start = e + position;
         int substr_len = (int)pmatch.rm_eo;
 
-        Log("match rules[%d] = \"%s\" at position %d with len %d: %.*s",
-            i, rules[i].regex, position, substr_len, substr_len, substr_start);
-
         position += substr_len;
 
         switch (rules[i].token_type) {
@@ -183,6 +180,10 @@ static bool token2val(int i, word_t *val) {
     result = strtoull(str, &end, 16);
   } else {
     result = strtoull(str, &end, 10);
+  }
+
+  if (*end == 'u' || *end == 'U') {
+    end++;
   }
 
   if (end == str || *end != '\0') {

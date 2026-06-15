@@ -19,8 +19,12 @@
 #include <readline/history.h>
 #include "sdb.h"
 #include <utils.h>
+#include <ctype.h>
+#include <errno.h>
+#include <inttypes.h>
 #include <stdlib.h>
 static int is_batch_mode = false;
+static const char *expr_test_file = NULL;
 
 void init_regex();
 void init_wp_pool();
@@ -147,7 +151,100 @@ void sdb_set_batch_mode() {
   is_batch_mode = true;
 }
 
+void sdb_set_expr_test_file(const char *file) {
+  expr_test_file = file;
+}
+
+static char *trim_left(char *s) {
+  while (isspace((unsigned char)*s)) {
+    s++;
+  }
+  return s;
+}
+
+static void trim_right(char *s) {
+  size_t len = strlen(s);
+  while (len > 0 && isspace((unsigned char)s[len - 1])) {
+    s[--len] = '\0';
+  }
+}
+
+static bool run_expr_tests(const char *file) {
+  FILE *fp = fopen(file, "r");
+  if (fp == NULL) {
+    perror(file);
+    return false;
+  }
+
+  static char line[131072];
+  int line_no = 0;
+  int total = 0;
+  int passed = 0;
+  int failed = 0;
+
+  while (fgets(line, sizeof(line), fp) != NULL) {
+    line_no++;
+
+    char *p = trim_left(line);
+    if (*p == '\0' || *p == '#') {
+      continue;
+    }
+
+    total++;
+
+    errno = 0;
+    char *end = NULL;
+    uint64_t expected_raw = strtoull(p, &end, 10);
+    if (p == end || errno != 0) {
+      printf("expr-test:%d: malformed expected value\n", line_no);
+      failed++;
+      continue;
+    }
+
+    char *expr_text = trim_left(end);
+    trim_right(expr_text);
+    if (*expr_text == '\0') {
+      printf("expr-test:%d: missing expression\n", line_no);
+      failed++;
+      continue;
+    }
+
+    bool success = false;
+    word_t actual = expr(expr_text, &success);
+    word_t expected = (word_t)expected_raw;
+
+    if (!success || actual != expected) {
+      printf("expr-test:%d: %s\n", line_no, expr_text);
+      if (!success) {
+        printf("  evaluator reported an invalid expression\n");
+      } else {
+        printf("  expected " FMT_WORD ", got " FMT_WORD "\n", expected, actual);
+      }
+      failed++;
+      continue;
+    }
+
+    passed++;
+  }
+
+  fclose(fp);
+
+  printf("expr-test: %d/%d passed", passed, total);
+  if (failed > 0) {
+    printf(", %d failed", failed);
+  }
+  printf("\n");
+
+  return total > 0 && failed == 0;
+}
+
 void sdb_mainloop() {
+  if (expr_test_file != NULL) {
+    bool ok = run_expr_tests(expr_test_file);
+    nemu_state.state = ok ? NEMU_QUIT : NEMU_ABORT;
+    return;
+  }
+
   if (is_batch_mode) {
     cmd_c(NULL);
     return;
